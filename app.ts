@@ -1,5 +1,3 @@
-#!/usr/bin/env ts-node
-
 import * as fs from "fs";
 
 import {
@@ -13,147 +11,110 @@ import {
     getOptionValues,
     Sourcelike,
     ClassType,
-    Type,
-    TypeAttributeKind,
-    JSONSchema,
-    Ref,
-    JSONSchemaType,
-    JSONSchemaAttributes,
     ClassProperty,
     Name
 } from "quicktype-core";
+import { SourcelikeArray } from "quicktype-core/dist/Source";
+import { AccessModifier } from "quicktype-core/dist/language/CSharp"
 
-/**
- * This type attribute stores information on types related to our game object domain.
- * Right now the only piece of information we store is whether a class must be a
- * subclass of GameObject, for which we only need a boolean.
- */
-class GameObjectTypeAttributeKind extends TypeAttributeKind<boolean> {
-    constructor() {
-        // This name is used only for debugging purposes.
-        super("gameObject");
-    }
-
-    // When two classes are combined, such as in a `oneOf` schema, the resulting
-    // class is a game object if at least one of the constituent classes is a game
-    // object.
-    combine(attrs: boolean[]): boolean {
-        return attrs.some(x => x);
-    }
-
-    // Type attributes are made inferred in cases where the given type
-    // participates in a union with other non-class types, for examples.  In
-    // those cases, the union type does not get the attribute at all.
-    makeInferred(_: boolean): undefined {
-        return undefined;
-    }
-
-    // For debugging purposes only.  It shows up when quicktype is run with
-    // with the `debugPrintGraph` option.
-    stringify(isGameObject: boolean): string {
-        return isGameObject.toString();
-    }
-}
-
-// We need to instantiate the attribute kind class to work with it.
-const gameObjectTypeAttributeKind = new GameObjectTypeAttributeKind();
-
-/**
- * This function produces, wherever appropriate, a game object type attribute
- * for a given schema type.  We do this for all object types, whether the
- * `gameObject` property is present in the schema or not (if it's not present,
- * the attribute will be `false`).  If it's present, it must be a boolean.
- */
-function gameObjectAttributeProducer(
-    schema: JSONSchema,
-    canonicalRef: Ref,
-    types: Set<JSONSchemaType>
-): JSONSchemaAttributes | undefined {
-    // booleans are valid JSON Schemas, too, but we won't produce our
-    // attribute for them.
-    if (typeof schema !== "object") return undefined;
-
-    // We only produce this attribute for object types.
-    if (!types.has("object")) return undefined;
-
-    let isGameObject: boolean;
-    if (schema.gameObject === undefined) {
-        isGameObject = false;
-    } else if (typeof schema.gameObject === "boolean") {
-        isGameObject = schema.gameObject;
-    } else {
-        throw new Error(`gameObject is not a boolean in ${canonicalRef}`);
-    }
-
-    return { forType: gameObjectTypeAttributeKind.makeAttributes(isGameObject) };
-}
-
-class DefaultValueTypeAttributeKind extends TypeAttributeKind<any> {
-    constructor() {
-        super("propertyDefaults");
-    }
-
-    combine(attrs: any[]): any {
-        const a = attrs[0];
-        for (let i = 1; i < attrs.length; i++) {
-            if (a !== attrs[i]) {
-                throw new Error("Inconsistent default values");
-            }
-        }
-        return a;
-    }
-
-    makeInferred(_: any): undefined {
-        return undefined;
-    }
-
-    stringify(v: any): string {
-        return JSON.stringify(v.toObject());
-    }
-}
-
-const defaultValueTypeAttributeKind = new DefaultValueTypeAttributeKind();
-
-function propertyDefaultsAttributeProducer(schema: JSONSchema): JSONSchemaAttributes | undefined {
-    // booleans are valid JSON Schemas, too, but we won't produce our
-    // attribute for them.
-    if (typeof schema !== "object") return undefined;
-
-    // Don't make an attribute if there's no default property.
-    if (typeof schema.default === undefined) return undefined;
-
-    return { forType: defaultValueTypeAttributeKind.makeAttributes(schema.default) };
-}
-
-class GameCSharpTargetLanguage extends CSharpTargetLanguage {
-    constructor() {
+class ReadOnlyStructCSharpTargetLanguage extends CSharpTargetLanguage {
+    public constructor() {
         super("C#", ["csharp"], "cs");
     }
 
     protected makeRenderer(renderContext: RenderContext, untypedOptionValues: { [name: string]: any }): CSharpRenderer {
-        return new GameCSharpRenderer(this, renderContext, getOptionValues(cSharpOptions, untypedOptionValues));
+        return new ReadOnlyStructCSharpRenderer(this, renderContext, getOptionValues(cSharpOptions, untypedOptionValues));
     }
 }
 
-class GameCSharpRenderer extends CSharpRenderer {
-    protected superclassForType(t: Type): Sourcelike | undefined {
-        if (!(t instanceof ClassType)) return undefined;
-
-        // All the type's attributes
-        const attributes = t.getAttributes();
-        // The game object attribute, or undefined
-        const isGameObject = gameObjectTypeAttributeKind.tryGetInAttributes(attributes);
-        return isGameObject ? "GameObject" : undefined;
+class ReadOnlyStructCSharpRenderer extends CSharpRenderer {
+    protected emitType(
+        description: string[] | undefined,
+        accessModifier: AccessModifier,
+        declaration: Sourcelike,
+        name: Sourcelike,
+        baseclass: Sourcelike | undefined,
+        emitter: () => void
+    ): void {
+        switch (accessModifier) {
+            case AccessModifier.Public:
+                declaration = ["public ", "readonly struct"];
+                break;
+            case AccessModifier.Internal:
+                declaration = ["internal ", "readonly struct"];
+                break;
+            default:
+                break;
+        }
+        this.emitDescription(description);
+        if (baseclass === undefined) {
+            this.emitLine(declaration, " ", name);
+        } else {
+            this.emitLine(declaration, " ", name, " : ", baseclass);
+        }
+        this.emitClassBlock(name, emitter);
     }
 
     protected propertyDefinition(p: ClassProperty, name: Name, c: ClassType, jsonName: string): Sourcelike {
         const originalDefinition = super.propertyDefinition(p, name, c, jsonName);
-        // The property's type attributes
-        const attributes = p.type.getAttributes();
-        const v = defaultValueTypeAttributeKind.tryGetInAttributes(attributes);
-        // If we don't have a default value, return the original definition
-        if (v === undefined) return originalDefinition;
-        return [originalDefinition, " = ", JSON.stringify(v), ";"];
+        const getOnlyDefinition = (originalDefinition as SourcelikeArray).slice();
+        getOnlyDefinition[4] = " { get; }";
+        return getOnlyDefinition;
+    }
+
+    private emitClassBlock(name: Sourcelike, f: () => void, semicolon: boolean = false): void {
+        this.emitLine("{");
+        this.indent(() => this.emitConstructor(name));
+        this.indent(f);
+        this.emitLine("}", semicolon ? ";" : "");
+    }
+
+    private emitConstructor(className: Sourcelike): void {
+        const classType = this.getClassTypeByName(className);
+
+        const assignments: SourcelikeArray = [];
+        const paramList: SourcelikeArray[] = [];
+        this.forEachClassProperty(classType, "none", (propName, jsonName, p) => {
+            const propDef = this.propertyDefinition(p, propName, classType, jsonName) as SourcelikeArray;
+            paramList.push([propDef[1], " ", jsonName]);
+            assignments.push([propName, " = ", jsonName, ";"]);
+        });
+
+        const params = ReadOnlyStructCSharpRenderer.intersperse(paramList, ", " as Sourcelike);
+
+        this.emitLine("public ", className, "(", ...params, ")");
+        this.emitBlock(() => {
+            for (const assignment of assignments) {
+                this.emitLine(assignment);
+            }
+        })
+        this.emitLine();
+    }
+
+    private getClassTypeByName(className: Sourcelike): ClassType {
+        let result;
+        this.forEachObject("none", (c: ClassType, otherClassName: Name) => {
+            if (className === otherClassName) {
+                result = c;
+            }
+        });
+
+        if (!result) {
+            throw new Error("Could not look up class type by name");
+        }
+
+        return result;
+    }
+
+    private static intersperse<T>(elements: T[], separator: T): T[] {
+        const result = [];
+        for (let i = 0; i < elements.length; i++) {
+            if (i !== 0) {
+                result.push(separator);
+            }
+            result.push(elements[i]);
+        }
+        return result;
     }
 }
 
@@ -167,10 +128,9 @@ async function main(program: string, args: string[]): Promise<void> {
     const source = { name: "Player", schema: fs.readFileSync(args[0], "utf8") };
 
     // We need to pass the attribute producer to the JSONSchemaInput
-    const producers = [gameObjectAttributeProducer, propertyDefaultsAttributeProducer];
-    await inputData.addSource("schema", source, () => new JSONSchemaInput(undefined, producers));
+    await inputData.addSource("schema", source, () => new JSONSchemaInput(undefined, []));
 
-    const lang = new GameCSharpTargetLanguage();
+    const lang = new ReadOnlyStructCSharpTargetLanguage();
 
     const { lines } = await quicktype({ lang, inputData });
 
